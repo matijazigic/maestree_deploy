@@ -1,0 +1,141 @@
+# Maestree full stack (dev) — including the BT.CPP app (maestree_test_tree).
+#
+#   docker compose -f maestree_deploy/local/maestree_compose_local.yaml up
+#
+# Brings up: Postgres → Go auth server → Node bridge → Vite web app, plus the
+# BT.CPP tree runtime (ROS 2 Humble) the bridge monitors.
+# The bridge fetches the auth server's Ed25519 PUBLIC key automatically from
+# GET /pubkey, so there is no manual key copy-paste.
+#
+# The tree runs as the `tree` service; the bridge reaches it in-network at
+# tree:1667/1668 (see ZMQ_HOST below). Ports 1667/1668 are also published to the
+# host so a desktop Groot2 can connect too.
+#
+# Open http://localhost:5173 after `up`. First register a user:
+#   curl -X POST localhost:8080/register -H 'content-type: application/json' \
+#     -d '{"username":"demo","password":"demo12345"}'
+
+services:
+  # ── Postgres ────────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: "maestree"
+      POSTGRES_PASSWORD: "maestree"
+      POSTGRES_DB: maestree
+    ports:
+      - "5432:5432"          # exposed for host tools (psql); auth uses the internal net
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U 'maestree' -d maestree"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ── Go auth server (creates its tables on startup) ──────────────────────────
+  auth:
+    image: golang:1.22
+    working_dir: /app
+    command: sh -c "go run ."
+    environment:
+      PORT: "8080"
+      # Password/user contain '@' → URL-encoded as %40 so the DSN parses correctly.
+      DATABASE_URL: "postgres://maestree:maestree@db:5432/maestree?sslmode=disable"
+      # Stable keypair across restarts. Leave empty for an ephemeral key (fine for
+      # a single `up`, but it changes on every restart). Generate one with:
+      #   head -c32 /dev/urandom | base64
+      AUTH_ED25519_SEED: "${AUTH_ED25519_SEED:-}"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../../maestree_server:/app
+      - go-mod:/go/pkg/mod
+      - go-build:/root/.cache/go-build
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ── Node bridge (auto-fetches the auth PUBLIC key) ──────────────────────────
+  bridge:
+    image: node:20
+    working_dir: /app
+    # The bridge itself waits for AUTH_URL/pubkey and fetches the key on startup
+    # (see resolveAuthPublicKey in auth.js) — no key handling needed here.
+    command: sh -c "npm install && node bridge.js"
+    environment:
+      AUTH_URL: "http://auth:8080"   # bridge fetches the public key from here
+      WS_PORT: "8082"
+      HTTP_PORT: "8081"
+      # The BT.CPP app runs as the `tree` service; reach it by service name.
+      ZMQ_HOST: "tree"
+      ZMQ_PORT: "1667"
+    ports:
+      - "8082:8082"          # WebSocket (live event stream)
+      - "8081:8081"          # HTTP control API
+    volumes:
+      - ../../maestree/bridge:/app
+      - bridge_node_modules:/app/node_modules
+    depends_on:
+      - auth
+      - tree
+
+  # ── Vite web app ────────────────────────────────────────────────────────────
+  web:
+    image: node:20
+    working_dir: /app
+    # --no-open: don't try to launch a browser inside the container (there is none);
+    # vite.config.ts has open:true for local dev, which we override here only.
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173 --no-open"
+    environment:
+      # Browser-facing URL — must be reachable from YOUR machine, not the compose net.
+      VITE_AUTH_URL: "http://localhost:8080"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../../maestree/web:/app
+      - web_node_modules:/app/node_modules
+    depends_on:
+      - auth
+      - bridge
+
+  # ── BT.CPP tree runtime (ROS 2 Humble) — the real tree Maestree monitors ────
+  # Builds the maestree_test_tree ament package against the mounted source, then
+  # runs it. The Groot2Publisher binds 1667 (REP) / 1668 (PUB) inside the
+  # container; the bridge connects at tree:1667.
+  #
+  # No tty/stdin: main.cpp blocks on std::cin.get() before ticking, but with no
+  # TTY stdin is at EOF so it returns immediately and the tree starts on its own.
+  # No network_mode:host / X11 / ROS_DOMAIN_ID — the tree uses only
+  # behaviortree_cpp + ament_index_cpp (no rclcpp/DDS), so it needs none of that.
+  tree:
+    build:
+      context: .
+      dockerfile: maestree_tree.Dockerfile
+    image: maestree-tree:humble
+    container_name: maestree_tree
+    working_dir: /maestree_test_tree
+    # Build, then run the binary directly with the tree XML as an arg. We skip
+    # `ros2 run`: in this mounted isolated-install layout `source install/setup.bash`
+    # fails to extend AMENT_PREFIX_PATH, so ros2 can't find the package. main.cpp
+    # takes the XML path as argv[1] (no ament index needed); sourcing ROS only
+    # provides the BehaviorTree.CPP runtime libs (LD_LIBRARY_PATH). exec so docker
+    # stop signals reach the binary, not bash.
+    command: >
+      bash -c "
+      source /opt/ros/humble/setup.bash &&
+      colcon build --packages-select maestree_test_tree &&
+      exec ./install/maestree_test_tree/lib/maestree_test_tree/maestree_test_tree src/tree.xml
+      "
+    ports:
+      - "1667:1667"          # ZMQ REP — Groot2 protocol (also lets host Groot2 connect)
+      - "1668:1668"          # ZMQ PUB — breakpoint-reached notifications
+    volumes:
+      - ../../maestree_test_tree:/maestree_test_tree
+
+volumes:
+  pgdata:
+  go-mod:
+  go-build:
+  bridge_node_modules:
+  web_node_modules:

@@ -1,0 +1,80 @@
+# Maestree licensing backend (SERVER-SIDE): Postgres + Go auth server + Caddy.
+#
+# Self-contained deployment for the auth/DB box. The bridge, web app and BT.CPP
+# run on CLIENT machines, not here — this box holds the private signing key + the
+# licensing database, so keep it locked down.
+#
+#   cd maestree_deploy
+#   cp .env.template .env              # then edit .env (secrets + AUTH_DOMAIN)
+#   docker compose up -d            # (file is named compose.yml → no -f needed)
+#
+# Caddy terminates HTTPS on :443 and reverse-proxies to the auth container over
+# the internal network. It auto-fetches/renews a Let's Encrypt cert for
+# AUTH_DOMAIN — so point AUTH_DOMAIN's DNS A record at this server's IP
+# (Cloudflare: "DNS only" / grey cloud) before starting.
+#
+# Only Caddy is published (80/443). Postgres (5432) and auth (8080) are
+# internal-only — never exposed to the host/internet. Firewall: allow 22/80/443.
+
+services:
+  # ── Postgres ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-maestree}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB: "${POSTGRES_DB:-maestree}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-maestree} -d ${POSTGRES_DB:-maestree}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # No host port mapping on purpose — only the auth service (same compose
+    # network) reaches the DB. For admin, use an SSH tunnel to the container.
+
+  # ── Go auth server ──────────────────────────────────────────────────────────
+  # On the server: `docker compose pull auth` grabs the prebuilt image from GHCR.
+  # Locally: `docker compose build auth` builds it from the repo (context =
+  # ../maestree_server, this file lives in maestree_deploy/).
+  auth:
+    image: ghcr.io/matijazigic/maestree-auth:latest
+    build:
+      context: ../maestree_server    # repo root (the Go source)
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      # NOTE: keep POSTGRES_PASSWORD alphanumeric (no @ : / # ?) so it needs no
+      # URL-encoding here. db host = the service name on the compose network.
+      DATABASE_URL: "postgres://${POSTGRES_USER:-maestree}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-maestree}?sslmode=disable"
+      AUTH_ED25519_SEED: "${AUTH_ED25519_SEED:?set AUTH_ED25519_SEED in .env (stable signing key)}"
+      ACCESS_TTL: "${ACCESS_TTL:-168h}"     # offline window (7 days)
+      REFRESH_TTL: "${REFRESH_TTL:-720h}"   # silent-renewal window (30 days)
+    # No host port — Caddy reaches it internally as http://auth:8080.
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ── Caddy (TLS reverse proxy) ───────────────────────────────────────────────
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"      # HTTP — ACME challenge + redirect to HTTPS
+      - "443:443"    # HTTPS
+    environment:
+      AUTH_DOMAIN: "${AUTH_DOMAIN:?set AUTH_DOMAIN in .env (e.g. auth.maestree.dev)}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # persisted certs — keep so it doesn't re-issue on restart
+      - caddy_config:/config
+    depends_on:
+      - auth
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

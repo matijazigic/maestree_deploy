@@ -1,0 +1,8 @@
+# Caddy config for the Maestree auth server (used by maestree_server_compose.yml).
+# AUTH_DOMAIN comes from the .env file (e.g. auth.maestree.dev). Caddy
+# auto-obtains and renews a Let's Encrypt cert for it, terminates HTTPS on :443,
+# and reverse-proxies to the auth container on the internal network.
+
+{$AUTH_DOMAIN} {
+	reverse_proxy auth:8080
+}
