@@ -21,6 +21,8 @@ services:
   db:
     image: postgres:16
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"   # loopback ONLY — reachable via SSH tunnel, never the internet
     environment:
       POSTGRES_USER: "${POSTGRES_USER:-maestree}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
