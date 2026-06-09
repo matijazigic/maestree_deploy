@@ -1,8 +1,16 @@
-# Caddy config for the Maestree auth server (used by maestree_server_compose.yml).
+# Caddy config for the Maestree auth server (used by compose.yml).
 # AUTH_DOMAIN comes from the .env file (e.g. auth.maestree.dev). Caddy
 # auto-obtains and renews a Let's Encrypt cert for it, terminates HTTPS on :443,
 # and reverse-proxies to the auth container on the internal network.
 
 {$AUTH_DOMAIN} {
 	reverse_proxy auth:8080
+
+	# Access log for every request (method, path, status, client IP, duration).
+	# Goes to stdout so `docker compose logs caddy` shows it. Request bodies are
+	# NOT logged, so passwords in POST /login never hit the logs.
+	log {
+		output stdout
+		format console
+	}
 }

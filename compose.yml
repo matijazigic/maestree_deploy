@@ -16,11 +16,20 @@
 # Only Caddy is published (80/443). Postgres (5432) and auth (8080) are
 # internal-only — never exposed to the host/internet. Firewall: allow 22/80/443.
 
+# Cap container logs so they can't fill the disk: rotate at 1 GB × 5 files =
+# 5 GB max per service; Docker deletes the oldest segment as new ones are written.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "1g"
+    max-file: "5"
+
 services:
   # ── Postgres ──────────────────────────────────────────────────────────────
   db:
     image: postgres:16
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "127.0.0.1:5432:5432"   # loopback ONLY — reachable via SSH tunnel, never the internet
     environment:
@@ -47,6 +56,7 @@ services:
       context: ../maestree_server    # repo root (the Go source)
       dockerfile: docker/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
     environment:
       PORT: "8080"
       # NOTE: keep POSTGRES_PASSWORD alphanumeric (no @ : / # ?) so it needs no
@@ -64,6 +74,7 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "80:80"      # HTTP — ACME challenge + redirect to HTTPS
       - "443:443"    # HTTPS
